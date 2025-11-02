@@ -1,63 +1,96 @@
+# predict.py
+
 import joblib
 import pandas as pd
 import json
 import warnings
-from datetime import datetime
+import os
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# --- 1. LOAD MODEL, COLUMNS, AND THE TEST SET "MENU" ---
-print("Loading model, column blueprint, and test set...")
+# --- 1. GLOBAL: LOAD ALL ARTIFACTS ---
 try:
     model = joblib.load("traffic_model.joblib")
+    
     with open('model_columns.json', 'r') as f:
         model_columns = json.load(f)
-    test_set_df = pd.read_csv("user_test_set.csv")
+        
+    with open('data_ranges.json', 'r') as f:
+        data_ranges = json.load(f)
+        
+    # Load traffic thresholds
+    traffic_thresholds = data_ranges.get('traffic_thresholds', 
+                                         {'low': 2000, 'high': 4500})
+        
 except FileNotFoundError:
     print("\n--- ERROR ---")
-    print("One or more files ('traffic_model.joblib', 'model_columns.json', 'user_test_set.csv') not found.")
+    print("One or more files ('traffic_model.joblib', 'model_columns.json', 'data_ranges.json') not found.")
     print("Please run train_model.py first to create these files.")
     exit()
 
-print("Model and test set loaded successfully.")
+# --- 2. PREDICTION FUNCTIONS ---
 
-# Calculate average traffic volume for user-friendly output
-average_traffic = test_set_df['traffic_volume'].mean()
+def classify_traffic(volume, thresholds):
+    """Converts a number into a human-readable label."""
+    if volume <= thresholds['low']:
+        return "LOW"
+    elif volume <= thresholds['high']:
+        return "MEDIUM"
+    else:
+        return "HIGH"
 
-def process_and_predict_from_input(user_input_dict):
+def process_and_predict_manual(temp, weather_main, dt_obj):
+    """
+    Mode 2: Takes user inputs and builds the feature row.
+    """
     data_row = {col: 0 for col in model_columns}
-    # Time features
+
+    # A. Date/Time features
+    data_row['hour'] = dt_obj.hour
+    data_row['day_of_week'] = dt_obj.dayofweek
+    data_row['month'] = dt_obj.month
+    data_row['year'] = dt_obj.year
+
+    # B. Temp feature
+    data_row['temp'] = temp
+
+    # === C. Weather feature ===
+    weather_main_col = f"weather_main_{weather_main}"
+    if weather_main_col in data_row:
+        data_row[weather_main_col] = 1
+
+    # D. Predict
     try:
-        dt = pd.to_datetime(user_input_dict['date_time'], dayfirst=True)
+        data_df = pd.DataFrame([data_row], columns=model_columns)
+        prediction = model.predict(data_df)
+        return prediction[0]
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        return None
+
+def process_and_predict_from_row(selected_row_series):
+    """
+    Mode 1: Takes a full row from the test_set CSV and processes it.
+    """
+    data_row = {col: 0 for col in model_columns}
+
+    try:
+        dt = pd.to_datetime(selected_row_series['date_time'], dayfirst=True)
         data_row['hour'] = dt.hour
         data_row['day_of_week'] = dt.dayofweek
         data_row['month'] = dt.month
         data_row['year'] = dt.year
     except Exception as e:
-        print(f"Error processing date/time: {e}")
+        print(f"Error processing date_time: {e}")
         return None
-    # Numeric features
-    try:
-        data_row['temp'] = float(user_input_dict['temp'])
-    except Exception:
-        # If user didn't provide temp, use average from test set
-        data_row['temp'] = test_set_df['temp'].mean()
-    # Optional weather info (one-hot)
-    weather_main = (user_input_dict.get('weather_main') or '').strip()
 
-    # Set weather_main
-    if weather_main:
-        for col in model_columns:
-            if col.startswith('weather_main_') and col.lower() == f"weather_main_{weather_main}".lower():
-                data_row[col] = 1
-                break
-    # Set holiday to None by default (or you can prompt for it)
-    if 'holiday_None' in data_row:
-        data_row['holiday_None'] = 1
-
-    # Use test set average for clouds_all if not provided
-    data_row['clouds_all'] = test_set_df['clouds_all'].mean()
+    data_row['temp'] = selected_row_series['temp']
+    
+    # === Add weather_main ===
+    weather_main_col = f"weather_main_{selected_row_series['weather_main']}"
+    if weather_main_col in data_row:
+        data_row[weather_main_col] = 1
 
     try:
         data_df = pd.DataFrame([data_row], columns=model_columns)
@@ -67,89 +100,192 @@ def process_and_predict_from_input(user_input_dict):
         print(f"Error during prediction: {e}")
         return None
 
-def traffic_comment(predicted, average):
-    ratio = predicted / average
-    if ratio < 0.7:
-        return "Traffic is less than average."
-    elif ratio < 1.2:
-        return "Traffic is around average."
-    else:
-        return "Traffic is higher than average."
+# --- 3. HELPER FUNCTIONS FOR MODES ---
 
-# --- 3. INTERACTIVE PREDICTION LOOP ---
-if __name__ == "__main__":
+def get_numeric_input(prompt, min_val, max_val):
+    """Helper to get a number from the user, with validation."""
+    while True:
+        val_str = input(prompt)
+        if val_str.lower() == 'q':
+            return 'q'
+        try:
+            val_float = float(val_str)
+            if not (min_val <= val_float <= max_val):
+                print("="*50)
+                print(f"--- WARNING: INPUT OUTSIDE TRAINING RANGE ---")
+                print(f"Your input: {val_float}K")
+                print(f"Model was trained on data between: {min_val:.2f}K and {max_val:.2f}K")
+                print("The prediction will be unreliable.")
+                print("="*50)
+            return val_float
+        except ValueError:
+            print("Invalid input. Please enter a number.")
 
-    print("\n--- Interactive Traffic Prediction ---")
-    print("You can choose a row from the test set, or enter your own values for prediction.")
+def get_categorical_input(prompt, allowed_categories):
+    """Helper to get categorical input, with validation."""
+    while True:
+        val_str = input(prompt)
+        if val_str.lower() == 'q':
+            return 'q'
+        
+        if val_str not in allowed_categories:
+            print("="*50)
+            print(f"--- WARNING: UNKNOWN CATEGORY ---")
+            print(f"Your input: '{val_str}' was not in the training data.")
+            print(f"The model will treat this as an 'unknown' category.")
+            print("Prediction will be less reliable.")
+            print(f"Known categories are: {', '.join(allowed_categories)}")
+            print("="*50)
+        return val_str
 
-    test_set_df = test_set_df.reset_index(drop=True)
-    print("\nHere are the first 5 rows from the test set ('user_test_set.csv'):")
+def get_date_time_input(date_prompt, time_prompt):
+    """Helper to get date and time separately. Allows future dates."""
+    while True:
+        date_str = input(date_prompt)
+        if date_str.lower() == 'q':
+            return 'q'
+        
+        time_str = input(time_prompt)
+        if time_str.lower() == 'q':
+            return 'q'
+        
+        val_str = f"{date_str} {time_str}"
+        try:
+            dt = pd.to_datetime(val_str, format='%d-%m-%Y %H:%M')
+            return dt
+        except ValueError:
+            print("Invalid date/time format. Please use 'DD-MM-YYYY' and 'HH:MM'.")
+            print("Please try entering both again.")
+
+def run_comparison_mode():
+    """Runs the "Compare with Test Data" mode."""
+    print("\n--- Mode 1: Compare with Test Data ---")
+    
+    if not os.path.exists("user_test_set.csv"):
+        print("\n--- ERROR ---")
+        print("File 'user_test_set.csv' not found.")
+        print("Please run train_model.py to generate this file.")
+        return
+
+    test_set_df = pd.read_csv("user_test_set.csv").reset_index(drop=True)
+    
+    print("\nHere are the first 5 rows from the test set:")
     try:
         print(test_set_df.head().to_markdown(numalign="left", stralign="left"))
     except ImportError:
-        print("\nNOTE: 'tabulate' package not found. Printing a basic table.")
+        print("(Note: 'tabulate' not installed. Printing basic table.)")
         print(test_set_df.head())
-
+    
     total_rows = len(test_set_df)
     print(f"\n(Total rows in test set: {total_rows})")
 
     while True:
-        print("\nOptions:")
-        print("  [0] Predict using a row from the test set")
-        print("  [1] Enter your own data for prediction")
-        print("  [q] Quit")
-        choice = input("Enter your choice: ").strip().lower()
-        if choice == 'q':
-            break
-        elif choice == '0':
-            try:
-                row_num_str = input(f"\nEnter a row number (0 to {total_rows - 1}) to predict: ")
-                row_num = int(row_num_str)
-                if not (0 <= row_num < total_rows):
-                    print(f"Error: Please enter a number between 0 and {total_rows - 1}.")
-                    continue
-                selected_row = test_set_df.iloc[row_num]
-                actual_traffic = selected_row['traffic_volume']
-                predicted_traffic = process_and_predict_from_input(selected_row)
+        try:
+            row_num_str = input(f"\nEnter a row number (0 to {total_rows - 1}) to predict (or 'b' to go back): ")
+            
+            if row_num_str.lower() == 'b':
+                break
+            row_num = int(row_num_str)
+            if not (0 <= row_num < total_rows):
+                print(f"Error: Please enter a number between 0 and {total_rows - 1}.")
+                continue
+                
+            selected_row = test_set_df.iloc[row_num]
+            actual_traffic = selected_row['traffic_volume']
+            
+            predicted_traffic = process_and_predict_from_row(selected_row)
+            
+            if predicted_traffic is not None:
+                traffic_label = classify_traffic(predicted_traffic, traffic_thresholds)
+                
                 print("\n--- Prediction Comparison ---")
                 print(f"Data for row:     {row_num}")
                 print(f"Time:             {selected_row['date_time']}")
-                print(f"Temperature:      {selected_row['temp']} °C")
-                print(f"Weather:          {selected_row['weather_main']}")
+                print(f"Weather:          {selected_row['weather_main']}") 
+                
+                difference = predicted_traffic - actual_traffic
+                percent_error_str = "N/A (Actual was 0)"
+                if actual_traffic != 0:
+                    percent_error = (difference / actual_traffic) * 100
+                    percent_error_str = f"{percent_error:.2f}%"
+                
                 print("\nRESULTS:")
                 print(f" > Actual Traffic:    {actual_traffic}")
-                print(f" > Predicted Traffic: {predicted_traffic:.0f}")
-                # Percentage difference calculation
-                if actual_traffic == 0:
-                    print(f" > Accuracy:          Cannot compute percentage difference (actual value is 0)")
-                else:
-                    percent_diff = abs(predicted_traffic - actual_traffic) / actual_traffic * 100
-                    print(f" > Accuracy:          {100 - percent_diff:.2f}% (Percentage similarity between prediction and actual value)")
-                    print(f" > Percentage Difference: {percent_diff:.2f}%")
-                print(f" > {traffic_comment(predicted_traffic, average_traffic)}")
-            except Exception as e:
-                print(f"An error occurred: {e}")
-        elif choice == '1':
-            print("Enter your data below. (Leave temperature or weather blank if not known)")
-            user_input = {}
-            date_str = input("Date (YYYY-MM-DD): ")
-            time_str = input("Time (HH:MM, 24-hour): ")
-            try:
-                user_input['date_time'] = f"{date_str} {time_str}"
-                # Validate date/time
-                _ = pd.to_datetime(user_input['date_time'], dayfirst=True)
-            except Exception:
-                print("Invalid date or time format. Try again.")
-                continue
-            temp = input("Temperature (°C, optional): ").strip()
-            user_input['temp'] = temp if temp else None
-            weather_main = input("Weather main (e.g. Clear, Clouds, Rain) [optional]: ").strip()
-            user_input['weather_main'] = weather_main if weather_main else None
-            predicted_traffic = process_and_predict_from_input(user_input)
-            print("\n--- Prediction Result ---")
-            print(f"Predicted Traffic Volume: {predicted_traffic:.0f}")
-            print(f"{traffic_comment(predicted_traffic, average_traffic)}")
+                print(f" > Predicted Traffic: {predicted_traffic:.0f} (This is {traffic_label} traffic)")
+                print(f" > Difference:        {difference:.0f} vehicles")
+                print(f" > Percent Error:     {percent_error_str}")
+
+        except ValueError:
+            print("Error: Invalid input. Please enter a number.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+def run_manual_mode():
+    """Runs the "Manual Data Entry" mode (simplified)."""
+    print("\n--- Mode 2: Manual Data Entry ---")
+    
+    temp_min = data_ranges['temp']['min']
+    temp_max = data_ranges['temp']['max']
+    temp_prompt = f"Enter Temperature (in Kelvin, e.g., {temp_min:.0f}-{temp_max:.0f}): "
+    
+    # === ADDED weather_main prompts ===
+    weather_categories = data_ranges['weather_main']['categories']
+    weather_prompt = f"Enter Weather Main (e.g., {', '.join(weather_categories[:3])}): "
+    
+    date_prompt = "Enter Date (DD-MM-YYYY): "
+    time_prompt = "Enter Time (HH:MM): "
+
+    while True:
+        print("\nEnter new data for prediction (or type 'q' at any prompt to quit):")
+        
+        temp = get_numeric_input(temp_prompt, temp_min, temp_max)
+        if temp == 'q': break
+        
+        # === ADDED: Ask for weather_main ===
+        weather_main = get_categorical_input(weather_prompt, weather_categories)
+        if weather_main == 'q': break
+        
+        dt_obj = get_date_time_input(date_prompt, time_prompt)
+        if dt_obj == 'q': break
+
+        # === UPDATED: Pass weather_main to the function ===
+        predicted_traffic = process_and_predict_manual(temp, weather_main, dt_obj)
+        
+        if predicted_traffic is not None:
+            traffic_label = classify_traffic(predicted_traffic, traffic_thresholds)
+            
+            print("\n" + "-" * 40)
+            print(f"  The Predicted Traffic Volume is: {predicted_traffic:.0f} (This is {traffic_label} traffic)")
+            print("-" * 40 + "\n")
+        
+        again = input("Predict again with new data? (y/n): ")
+        if again.lower() != 'y':
+            break
+
+# --- 4. MAIN SCRIPT ---
+if __name__ == "__main__":
+    
+    print("\n" + "=" * 40)
+    print("     Traffic Volume Prediction")
+    print("=" * 40)
+    print("Model loaded successfully.")
+    
+    while True:
+        print("\n--- Main Menu ---")
+        print("Choose a prediction mode:")
+        print("  1: Compare with Test Data")
+        print("  2: Enter Manual Data")
+        print("  q: Quit")
+        
+        choice = input("Enter choice (1, 2, or q): ")
+        
+        if choice == '1':
+            run_comparison_mode()
+        elif choice == '2':
+            run_manual_mode()
+        elif choice.lower() == 'q':
+            break
         else:
-            print("Invalid choice. Please select 0, 1, or q.")
+            print("Invalid choice. Please enter 1, 2, or q.")
 
     print("\nExiting program.")
