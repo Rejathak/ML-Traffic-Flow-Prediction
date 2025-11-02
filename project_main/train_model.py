@@ -1,5 +1,3 @@
-# train_model.py
-
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import GradientBoostingRegressor
@@ -80,6 +78,36 @@ def main():
 
     # 3. Preprocessing
     df_processed = preprocess_data(df)
+
+    # === BEGIN FEATURE SELECTION SECTION ===
+
+
+    # Base features to keep (from your graph)
+    important_features = [
+        'hour',
+        'day_of_week',
+        'temp',
+        'month',
+        'year',
+        'rain_1h',
+        'snow_1h',
+        'clouds_all',
+        'holiday',
+        # Add more if required
+    ]
+
+    # Always keep the target
+    selected_columns = [col for col in df_processed.columns if
+                        col in important_features or
+                        col.startswith('holiday_') or
+                        col.startswith('weather_description_') or
+                        col.startswith('weather_main_') or
+                        col == 'traffic_volume']
+
+    df_processed = df_processed[selected_columns]
+
+
+    # === END FEATURE SELECTION SECTION ===
 
     # 4. Define Features (X) and Target (y)
     print("[Step 6/8] Separating features (X) and target (y)...")
